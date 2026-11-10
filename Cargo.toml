@@ -1,0 +1,27 @@
+[package]
+name = "RustQuran"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+
+[dependencies]
+eframe = "0.33.3"
+egui_extras = { version = "0.33.3", features = ["image"] }
+env_logger = "0.11.8"
+log = "0.4.27"
+ab_glyph = "0.2"
+winit = { version = "0.30.11", features = ["android-native-activity"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15.1"
+jni = "0.21"
+libc = "0.2"
+
+# Faster app: the default debug build is unoptimised, which makes startup and
+# scrolling slow. Level 2 keeps debug info but runs several times faster.
+[profile.dev]
+opt-level = 2
