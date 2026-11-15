@@ -313,6 +313,22 @@ impl QuranDataset {
             .unwrap_or("")
     }
 
+    /// Forgets a downloaded translation (after the user deleted its file).
+    pub fn clear_translation(&mut self, t: usize) {
+        let n = self.verses.len();
+        if let Some(list) = self.translations.get_mut(t) {
+            *list = vec![""; n];
+        }
+    }
+
+    /// Forgets a downloaded tafsir (after the user deleted its file).
+    pub fn clear_tafsir(&mut self, t: usize) {
+        let n = self.verses.len();
+        if let Some(list) = self.tafsirs.get_mut(t) {
+            *list = vec![""; n];
+        }
+    }
+
     /// Installs the text of a downloaded translation. Returns false (and changes
     /// nothing) when the text does not look like a translation file.
     pub fn set_translation_text(&mut self, t: usize, text: String) -> bool {

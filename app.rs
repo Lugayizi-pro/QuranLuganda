@@ -1,4 +1,4 @@
-//! RustQuran: glassmorphic Quran reader for egui / eframe 0.31 (Android + desktop).
+ //! RustQuran: glassmorphic Quran reader for egui / eframe 0.31 (Android + desktop).
 
 use core::f32;
 use std::collections::HashMap;
@@ -141,6 +141,13 @@ const AUTO_PX_PER_LEVEL: f32 = 6.0;
 // Translation text size range (slider in Reader settings).
 const MIN_TRANS: f32 = 12.0;
 const MAX_TRANS: f32 = 32.0;
+
+/// What the user asked to delete (asked to confirm first).
+#[derive(Clone, Copy, PartialEq)]
+enum DeleteTarget {
+    Translation(usize),
+    Tafsir(usize),
+}
 
 enum AudioAction {
     Download(usize),
@@ -533,6 +540,9 @@ pub struct QuranApp {
     layout_key: LayoutKey,
     layouts_dirty: bool,
     pending_jump: Option<(usize, Option<usize>)>,
+    /// (surah, verse) of a tapped search result: the next jump puts it in the middle
+    /// of the screen instead of at the top.
+    center_jump: Option<(usize, usize)>,
     est_words: Vec<u32>,
     est_trans: Vec<u32>,
 
@@ -551,6 +561,10 @@ pub struct QuranApp {
     bar_visible: bool,
     /// Height of the bar / keyboard at the bottom of the screen right now.
     bottom_inset: f32,
+    /// Height of the system keyboard (points), 0 when hidden.
+    kb_lift: f32,
+    kb_init: bool,
+    kb_poll_time: f64,
     last_offset: f32,
     scroll_accum: f32,
     bar_toggle_time: f64,
@@ -585,6 +599,8 @@ pub struct QuranApp {
     tafsir_dl: std::sync::Arc<std::sync::Mutex<TransDl>>,
     /// Last tafsir download problem.
     tafsir_msg: Option<String>,
+    /// A translation / tafsir the user wants to delete: waiting for "Delete" or "Cancel".
+    confirm_delete: Option<DeleteTarget>,
     /// Downloaded translations that have a newer version online.
     trans_update: Vec<bool>,
     /// The online version check has been started this run.
@@ -624,6 +640,12 @@ pub struct QuranApp {
     audio_end: u32,
     audio_paused: bool,
     audio_single: bool,
+    /// The verse playing now was tapped on its own: when it ends it does not start the
+    /// next verse (it either resumes `audio_resume` or stops).
+    audio_oneshot: bool,
+    /// A surah was playing when a verse of ANOTHER surah was tapped: the verse that was
+    /// playing then. That surah carries on from it after the tapped verse.
+    audio_resume: Option<u32>,
     /// Index into `audio::RECITERS`.
     reciter: usize,
     /// Colour the letters by tajweed rule.
@@ -648,7 +670,7 @@ pub struct QuranApp {
     audio_msg_until: f64,
     audio_hint_shown: bool,
     /// (surah, whole surah downloaded, time checked)
-    audio_ready_cache: (usize, bool, f64),
+    audio_ready_cache: [(usize, bool, f64); 2],
 }
 
 impl QuranApp {
@@ -712,6 +734,7 @@ impl QuranApp {
             layout_key: LayoutKey::default(),
             layouts_dirty: false,
             pending_jump: None,
+            center_jump: None,
             est_words,
             est_trans,
             fling_vel: 0.0,
@@ -722,6 +745,9 @@ impl QuranApp {
             auto_pushed: false,
             bar_visible: true,
             bottom_inset: 0.0,
+            kb_lift: 0.0,
+            kb_init: false,
+            kb_poll_time: 0.0,
             last_offset: 0.0,
             scroll_accum: 0.0,
             bar_toggle_time: 0.0,
@@ -748,6 +774,7 @@ impl QuranApp {
             tafsir_update: vec![false; TRANSLATIONS.len()],
             tafsir_dl: Default::default(),
             tafsir_msg: None,
+            confirm_delete: None,
             trans_update: vec![false; TRANSLATIONS.len()],
             trans_checked: false,
             trans_auto: false,
@@ -775,6 +802,8 @@ impl QuranApp {
             audio_end: 0,
             audio_paused: false,
             audio_single: false,
+            audio_oneshot: false,
+            audio_resume: None,
             reciter: 0,
             show_tajweed: false,
             sidebar_section: None,
@@ -788,7 +817,7 @@ impl QuranApp {
             audio_msg: String::new(),
             audio_msg_until: 0.0,
             audio_hint_shown: false,
-            audio_ready_cache: (usize::MAX, false, -10.0),
+            audio_ready_cache: [(usize::MAX, false, -10.0); 2],
         };
 
         let saved = read_save_file().or_else(|| cc.storage.and_then(|s| s.get_string(STORE_KEY)));
@@ -972,6 +1001,96 @@ impl QuranApp {
                     .sum::<u32>()
             })
             .collect();
+    }
+
+    /// Removes a downloaded translation or tafsir from the phone (after the user confirmed).
+    fn delete_downloaded(&mut self, target: DeleteTarget) {
+        let dir = translations_dir();
+        match target {
+            DeleteTarget::Translation(i) => {
+                if let Some(dir) = &dir {
+                    let _ = std::fs::remove_file(dir.join(TRANSLATIONS[i].file));
+                }
+                self.data.clear_translation(i);
+                self.trans_ready[i] = false;
+                self.trans_update[i] = false;
+                if self.translation_idx == i {
+                    // Move to another translation that is on the phone, if there is one.
+                    match self.trans_ready.iter().position(|r| *r) {
+                        Some(j) => self.set_translation(j),
+                        None => {
+                            self.recompute_est_trans();
+                            self.layouts_dirty = true;
+                            if !self.search_applied.trim().is_empty() {
+                                self.recompute_search();
+                            }
+                        }
+                    }
+                }
+            }
+            DeleteTarget::Tafsir(i) => {
+                if let Some(dir) = &dir {
+                    let _ = std::fs::remove_file(dir.join(TRANSLATIONS[i].tafsir_file));
+                }
+                self.data.clear_tafsir(i);
+                self.tafsir_ready[i] = false;
+                self.tafsir_update[i] = false;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// "Are you sure?" box shown before a translation or tafsir is deleted.
+    fn delete_confirm(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.confirm_delete else {
+            return;
+        };
+        let (name, what) = match target {
+            DeleteTarget::Translation(i) => (TRANSLATIONS[i].name, "translation"),
+            DeleteTarget::Tafsir(i) => (TRANSLATIONS[i].name, "tafsir"),
+        };
+        let th = self.theme;
+        let screen = ctx.content_rect();
+        let mut yes = false;
+        let mut no = false;
+        egui::Area::new(egui::Id::new("delete_scrim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(130));
+                if ui.allocate_rect(screen, Sense::click()).clicked() {
+                    no = true;
+                }
+            });
+        egui::Window::new("delete_confirm")
+            .id(egui::Id::new("delete_confirm_window"))
+            .title_bar(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .resizable(false)
+            .collapsible(false)
+            .default_width((screen.width() * 0.8).min(380.0))
+            .frame(theme::window_frame(th))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("Delete the {name} {what}?")).strong());
+                ui.label("It is removed from this phone. You can download it again later.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if pill_button(ui, "Delete", false, 14.0, 12.0).clicked() {
+                        yes = true;
+                    }
+                    if pill_button(ui, "Cancel", false, 14.0, 12.0).clicked() {
+                        no = true;
+                    }
+                });
+            });
+        if yes {
+            self.confirm_delete = None;
+            self.delete_downloaded(target);
+        } else if no {
+            self.confirm_delete = None;
+        }
     }
 
     fn set_translation(&mut self, idx: usize) {
@@ -1294,6 +1413,45 @@ impl QuranApp {
             self.sidebar_open = false;
         }
         self.dirty = true;
+    }
+
+    /// A tapped search result: open its surah, highlight the verse (it gets the same
+    /// colour as a tapped verse and becomes the reading place) and centre it on screen.
+    fn open_search_result(&mut self, global: u32) {
+        self.jump_to_verse(global);
+        self.last_read = Some(global);
+        let v = self.data.verses[global as usize];
+        let surah = v.surah as usize - 1;
+        let (start, _) = self.data.surah_range(surah);
+        self.center_jump = Some((surah, (global - start) as usize));
+    }
+
+    /// Height of verse `v` of surah `s` on screen (one line if it cannot be measured).
+    fn verse_height(&self, s: usize, v: usize) -> f32 {
+        let line_h = self.m.line_h;
+        let Some(lay) = self.layouts[s].as_ref() else {
+            return line_h;
+        };
+        if self.show_translation {
+            match (lay.verse_y.get(v), lay.verse_y.get(v + 1)) {
+                (Some(a), Some(b)) => (b - a).max(line_h),
+                _ => line_h,
+            }
+        } else {
+            let Some(&(a, b)) = lay.verse_items.get(v) else {
+                return line_h;
+            };
+            let (a, b) = (a as usize, b as usize);
+            let line_of = |item: usize| {
+                lay.flow_lines
+                    .iter()
+                    .position(|l| (l.first as usize) <= item && item < l.end as usize)
+            };
+            match (line_of(a), line_of(b.saturating_sub(1).max(a))) {
+                (Some(l0), Some(l1)) if l1 >= l0 => (l1 - l0 + 1) as f32 * line_h,
+                _ => line_h,
+            }
+        }
     }
 
     fn toggle_bookmark(&mut self, global: u32) {
@@ -2032,6 +2190,24 @@ impl eframe::App for QuranApp {
         }
 
         self.status_inset(ctx);
+        // Make room for the system keyboard: Android draws it over the app.
+        if !self.kb_init {
+            self.kb_init = true;
+            audio::keyboard_height_px(); // first call: remembers the "no keyboard" size
+        }
+        let now = ctx.input(|i| i.time);
+        if (ctx.wants_keyboard_input() || self.kb_lift > 0.0) && now - self.kb_poll_time > 0.08 {
+            self.kb_poll_time = now;
+            self.kb_lift = audio::keyboard_height_px() as f32 / ctx.pixels_per_point();
+        }
+        let lift = ctx.animate_value_with_time(egui::Id::new("kb_lift"), self.kb_lift, 0.15);
+        if lift > 0.5 {
+            egui::TopBottomPanel::bottom("kb_spacer")
+                .exact_height(lift)
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .show(ctx, |_| {});
+        }
         // Bottom panels stack upwards: the keyboard is lowest, the bar sits above it.
         self.arabic_keyboard(ctx);
         self.top_bar(ctx);
@@ -2042,6 +2218,7 @@ impl eframe::App for QuranApp {
         self.position_pill(ctx);
         self.quick_jump_window(ctx);
         self.verse_menu(ctx);
+        self.delete_confirm(ctx);
         self.audio_bar(ctx);
         self.guide_overlay(ctx);
 
@@ -2079,22 +2256,77 @@ impl QuranApp {
     }
 
     /// Is the whole surah downloaded? Checked at most once a second.
-    fn surah_audio_ready(&mut self, ctx: &egui::Context, s: usize) -> bool {
+    /// `slot` 0 = the download target, 1 = the surah on screen (each has its own cache).
+    fn surah_audio_ready(&mut self, ctx: &egui::Context, s: usize, slot: usize) -> bool {
         let now = ctx.input(|i| i.time);
-        if self.audio_ready_cache.0 != s || now - self.audio_ready_cache.2 > 1.0 {
+        if self.audio_ready_cache[slot].0 != s || now - self.audio_ready_cache[slot].2 > 1.0 {
             let ready = audio::all_exist(self.reciter, &self.surah_audio_verses(s));
-            self.audio_ready_cache = (s, ready, now);
+            self.audio_ready_cache[slot] = (s, ready, now);
         }
-        self.audio_ready_cache.1
+        self.audio_ready_cache[slot].1
+    }
+
+    /// Forget the cached "is it downloaded" answers (after a download or a delete).
+    fn audio_ready_reset(&mut self) {
+        for c in self.audio_ready_cache.iter_mut() {
+            c.2 = -10.0;
+        }
     }
 
     fn stop_audio(&mut self) {
         self.audio_player.stop();
         self.audio_playing = None;
         self.audio_paused = false;
+        self.audio_oneshot = false;
+        self.audio_resume = None;
     }
 
-    /// Plays one verse, then (unless "one verse only" is on) the rest of the surah.
+    /// A verse was tapped while "Play one verse only" is on.
+    ///  * nothing is playing: that verse plays alone and stops;
+    ///  * a surah is playing and the verse belongs to it: the surah carries on from the
+    ///    tapped verse (the verses after it, whether it was before or after the old place);
+    ///  * the verse belongs to another surah: it plays alone, then the surah that was
+    ///    playing resumes from the verse it was on.
+    fn tap_play(&mut self, ctx: &egui::Context, global: u32) {
+        let Some(v) = self.data.verses.get(global as usize).copied() else {
+            return;
+        };
+        // A surah that is playing on its own (not a one-off verse).
+        let session = self.audio_playing.filter(|_| !self.audio_oneshot);
+        // The surah that carries on after any one-off verse: the playing one, or the
+        // one that was interrupted earlier.
+        let main = session.or(self.audio_resume);
+        if main.is_some() && !audio::verse_exists(self.reciter, v.surah, v.ayah) {
+            // Its audio is not on the phone: leave what is playing alone.
+            self.toast(ctx, "Download this surah's audio first: menu > Audio");
+            return;
+        }
+        match main {
+            None => {
+                self.audio_oneshot = true;
+                self.audio_resume = None;
+            }
+            Some(m) => {
+                let same_surah = self.data.verses.get(m as usize).map(|mv| mv.surah) == Some(v.surah);
+                if same_surah {
+                    // Carry on from the tapped verse.
+                    self.audio_oneshot = false;
+                    self.audio_resume = None;
+                } else {
+                    self.audio_oneshot = true;
+                    // Remember where the playing surah was (a second interruption keeps
+                    // the first resume point).
+                    if session.is_some() {
+                        self.audio_resume = session;
+                    }
+                }
+            }
+        }
+        self.play_audio(ctx, global, false);
+    }
+
+    /// Plays one verse; the tick then goes on with the rest of the surah (unless the
+    /// verse was tapped on its own, see `tap_play`).
     fn play_audio(&mut self, ctx: &egui::Context, global: u32, follow: bool) {
         if !audio::AVAILABLE {
             return;
@@ -2148,18 +2380,28 @@ impl QuranApp {
         }
         if let Some(m) = finished_msg {
             self.audio_download = None;
-            self.audio_ready_cache.2 = -10.0;
+            self.audio_ready_reset();
             self.toast(ctx, m);
         }
 
         if let Some(cur) = self.audio_playing {
             if !self.audio_paused {
                 if self.audio_player.is_finished() {
-                    let next = cur + 1;
-                    if self.audio_single || next >= self.audio_end {
-                        self.stop_audio();
+                    if self.audio_oneshot {
+                        // A tapped verse is done: carry on with the surah that was
+                        // interrupted, or stop if there was none.
+                        self.audio_oneshot = false;
+                        match self.audio_resume.take() {
+                            Some(r) => self.play_audio(ctx, r, true),
+                            None => self.stop_audio(),
+                        }
                     } else {
-                        self.play_audio(ctx, next, true);
+                        let next = cur + 1;
+                        if next >= self.audio_end {
+                            self.stop_audio();
+                        } else {
+                            self.play_audio(ctx, next, true);
+                        }
                     }
                 }
                 ctx.request_repaint_after(Duration::from_millis(150));
@@ -2240,6 +2482,8 @@ impl QuranApp {
             }
             AudioAction::PlaySurah(s) => {
                 let (start, _) = self.data.surah_range(s);
+                self.audio_oneshot = false;
+                self.audio_resume = None;
                 self.play_audio(ctx, start, true);
                 if self.compact {
                     self.sidebar_open = false;
@@ -2259,7 +2503,7 @@ impl QuranApp {
                     .filter(|&(_, a)| a != 0)
                     .collect();
                 audio::delete(self.reciter, &verses);
-                self.audio_ready_cache.2 = -10.0;
+                self.audio_ready_reset();
                 self.toast(ctx, "Audio deleted");
             }
         }
@@ -2363,20 +2607,28 @@ impl QuranApp {
         ctx.request_repaint();
     }
 
+    /// True while the top bar (and the status-bar space above it) is on screen.
+    /// One rule for both, so they always hide and show together.
+    fn bar_is_visible(&self) -> bool {
+        self.bar_visible
+            || self.sidebar_open
+            || self.ar_kbd_open
+            || !self.search_applied.trim().is_empty()
+    }
+
     fn status_inset(&mut self, ctx: &egui::Context) {
+        // Slides away with the top bar when the user scrolls, and comes back with it.
+        let visible = self.bar_is_visible();
         egui::TopBottomPanel::top("status_inset")
             .frame(theme::inset_frame(self.theme))
             .exact_height(TOP_INSET)
-            .show(ctx, |_ui| {});
+            .show_animated(ctx, visible, |_ui| {});
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
-        let visible = self.bar_visible
-            || self.sidebar_open
-            || self.ar_kbd_open
-            || !self.search_applied.trim().is_empty();
+        let visible = self.bar_is_visible();
 
-        egui::TopBottomPanel::bottom("top_bar")
+        egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::new()
                     .fill(theme::bar_frame(self.theme).fill)
@@ -2488,17 +2740,31 @@ impl QuranApp {
         let mut pick_translation: Option<usize> = None;
         let mut start_download: Option<usize> = None;
         let mut start_tafsir: Option<usize> = None;
+        let mut ask_delete: Option<DeleteTarget> = None;
         let mut audio_action: Option<AudioAction> = None;
         let mut reciter_changed = false;
         let mut show_guide = false;
-        let audio_s = self
+        // The surah on screen. The last short surahs can never reach the top of the screen
+        // (the page ends first), so this alone could never select them.
+        let screen_s = self
             .current_anchor()
             .map(|(s, _)| s)
             .unwrap_or(self.selected_surah);
-        let audio_ready = if audio::AVAILABLE && self.sidebar_open {
-            self.surah_audio_ready(ctx, audio_s)
+        // Download / delete work on the surah of the verse the user last tapped; with no
+        // tapped verse they work on the surah on screen.
+        let selected_s = self
+            .last_read
+            .and_then(|g| self.data.verses.get(g as usize))
+            .map(|v| v.surah as usize - 1);
+        let audio_s = selected_s.unwrap_or(screen_s);
+        let (audio_ready, screen_ready) = if audio::AVAILABLE && self.sidebar_open {
+            (
+                self.surah_audio_ready(ctx, audio_s, 0),
+                // The surah on screen can be played too, if it is a different one.
+                screen_s != audio_s && self.surah_audio_ready(ctx, screen_s, 1),
+            )
         } else {
-            false
+            (false, false)
         };
 
         let mut sidebar_section = self.sidebar_section;
@@ -2512,71 +2778,67 @@ impl QuranApp {
                         } else {
                             format!("{} \u{b7} {}", t.name, t.language)
                         };
-                        if downloading == Some(i) {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Spinner::new());
-                                let what = if self.trans_ready[i] { "updating" } else { "downloading" };
-                                ui.label(format!("{label} \u{2013} {what}..."));
-                            });
-                        } else if self.trans_ready[i] {
-                            ui.horizontal(|ui| {
+                        // One line per translation:
+                        //   name ............ [translation icon]  Tafsir [tafsir icon]
+                        // An icon downloads; once downloaded it becomes a bin that asks
+                        // before deleting; a circular arrow means a newer version is online.
+                        ui.horizontal(|ui| {
+                            if self.trans_ready[i] {
                                 if ui
                                     .selectable_label(i == self.translation_idx, label)
                                     .clicked()
                                 {
                                     pick_translation = Some(i);
                                 }
-                                if self.trans_update[i]
-                                    && ui
-                                        .add_enabled(downloading.is_none(), egui::Button::new("Update available").small())
-                                        .clicked()
-                                {
-                                    start_download = Some(i);
-                                }
-                            });
-                        } else if ui
-                            .add_enabled(
-                                downloading.is_none(),
-                                egui::Button::new(format!("{label} \u{2013} Download ({})", t.size)),
-                            )
-                            .clicked()
-                        {
-                            start_download = Some(i);
-                        }
-                        // The tafsir that goes with this translation.
-                        if self.trans_ready[i] {
-                            ui.horizontal(|ui| {
-                                ui.add_space(18.0);
-                                if tafsir_busy == Some(i) {
-                                    ui.add(egui::Spinner::new());
-                                    ui.label(RichText::new("tafsir downloading...").small());
-                                } else if self.tafsir_ready[i] {
-                                    ui.label(RichText::new("Tafsir ready").small().weak());
-                                    if self.tafsir_update[i]
-                                        && ui
-                                            .add_enabled(
-                                                tafsir_busy.is_none(),
-                                                egui::Button::new("Tafsir update available").small(),
-                                            )
-                                            .clicked()
+                            } else {
+                                ui.label(RichText::new(label).weak());
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let round = egui::vec2(28.0, 28.0);
+                                let orange = Color32::from_rgb(230, 140, 40);
+                                // Tafsir (only for a translation that is on the phone): rightmost.
+                                if self.trans_ready[i] {
+                                    if tafsir_busy == Some(i) {
+                                        ui.add(egui::Spinner::new().size(18.0));
+                                    } else if self.tafsir_ready[i] && self.tafsir_update[i] {
+                                        if icon_button_sized(ui, round, Some(orange), paint_update_icon).clicked()
+                                            && tafsir_busy.is_none()
+                                        {
+                                            start_tafsir = Some(i);
+                                        }
+                                    } else if self.tafsir_ready[i] {
+                                        if icon_button_sized(ui, round, None, paint_trash_icon).clicked() {
+                                            ask_delete = Some(DeleteTarget::Tafsir(i));
+                                        }
+                                    } else if icon_button_sized(ui, round, None, paint_download_icon).clicked()
+                                        && tafsir_busy.is_none()
                                     {
                                         start_tafsir = Some(i);
                                     }
-                                } else {
-                                    let label = if t.tafsir_size.is_empty() {
-                                        "Download tafsir".to_string()
-                                    } else {
-                                        format!("Download tafsir ({})", t.tafsir_size)
-                                    };
-                                    if ui
-                                        .add_enabled(tafsir_busy.is_none(), egui::Button::new(label).small())
-                                        .clicked()
+                                    ui.label(RichText::new("Tafsir").small().weak());
+                                }
+                                // The translation itself.
+                                if !t.is_bundled() {
+                                    if downloading == Some(i) {
+                                        ui.add(egui::Spinner::new().size(18.0));
+                                    } else if self.trans_ready[i] && self.trans_update[i] {
+                                        if icon_button_sized(ui, round, Some(orange), paint_update_icon).clicked()
+                                            && downloading.is_none()
+                                        {
+                                            start_download = Some(i);
+                                        }
+                                    } else if self.trans_ready[i] {
+                                        if icon_button_sized(ui, round, None, paint_trash_icon).clicked() {
+                                            ask_delete = Some(DeleteTarget::Translation(i));
+                                        }
+                                    } else if icon_button_sized(ui, round, None, paint_download_icon).clicked()
+                                        && downloading.is_none()
                                     {
-                                        start_tafsir = Some(i);
+                                        start_download = Some(i);
                                     }
                                 }
                             });
-                        }
+                        });
                     }
                     if downloading.is_none()
                         && self.trans_msg.is_none()
@@ -2597,28 +2859,46 @@ impl QuranApp {
 
             if audio::AVAILABLE {
                 section(ui, &mut sidebar_section, 1, "Audio", |ui| {
-                    // Reciter choice (locked while a download is running).
-                    ui.add_enabled_ui(self.audio_download.is_none(), |ui| {
-                        egui::ComboBox::from_id_salt("reciter_pick")
-                            .selected_text(audio::RECITERS[self.reciter].name)
-                            .show_ui(ui, |ui| {
-                                for (i, r) in audio::RECITERS.iter().enumerate() {
-                                    if ui.selectable_value(&mut self.reciter, i, r.name).changed() {
-                                        reciter_changed = true;
+                    // One compact row: the reciter, the surah name, and a round icon on the
+                    // right (download / cancel while downloading / tick when downloaded).
+                    ui.horizontal(|ui| {
+                        // Reciter choice (locked while a download is running).
+                        ui.add_enabled_ui(self.audio_download.is_none(), |ui| {
+                            egui::ComboBox::from_id_salt("reciter_pick")
+                                .selected_text(audio::RECITERS[self.reciter].name)
+                                .show_ui(ui, |ui| {
+                                    for (i, r) in audio::RECITERS.iter().enumerate() {
+                                        if ui.selectable_value(&mut self.reciter, i, r.name).changed() {
+                                            reciter_changed = true;
+                                        }
                                     }
+                                });
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let round = egui::vec2(32.0, 32.0);
+                            if self.audio_download.is_some() {
+                                if icon_button_sized(ui, round, None, paint_cancel_icon).clicked() {
+                                    audio_action = Some(AudioAction::Cancel);
                                 }
-                            });
+                            } else if audio_ready {
+                                // Downloaded: a green tick (nothing to press).
+                                icon_button_sized(ui, round, Some(Color32::from_rgb(60, 160, 90)), paint_check_icon);
+                            } else if icon_button_sized(ui, round, None, paint_download_icon).clicked() {
+                                audio_action = Some(AudioAction::Download(audio_s));
+                            }
+                            // Name of the surah this audio belongs to.
+                            ui.add(
+                                egui::Label::new(RichText::new(SURAHS[audio_s].translit).weak())
+                                    .truncate(),
+                            );
+                        });
                     });
-                    ui.weak(SURAHS[audio_s].translit);
                     if let Some(d) = &self.audio_download {
                         let frac = d.done() as f32 / d.total.max(1) as f32;
                         ui.add(
                             egui::ProgressBar::new(frac)
                                 .text(format!("Downloading {}/{}", d.done(), d.total)),
                         );
-                        if pill_button(ui, "Cancel", false, 14.0, 10.0).clicked() {
-                            audio_action = Some(AudioAction::Cancel);
-                        }
                     } else if audio_ready {
                         ui.horizontal_wrapped(|ui| {
                             if pill_button(ui, "Play surah", false, 14.0, 10.0).clicked() {
@@ -2628,8 +2908,16 @@ impl QuranApp {
                                 audio_action = Some(AudioAction::Delete(audio_s));
                             }
                         });
-                    } else if pill_button(ui, "Download this surah", false, 14.0, 10.0).clicked() {
-                        audio_action = Some(AudioAction::Download(audio_s));
+                    }
+                    // The surah on screen (when it is not the one above) can be played too.
+                    if screen_ready && self.audio_download.is_none() {
+                        let label = format!("Play on screen: {}", SURAHS[screen_s].translit);
+                        if pill_button(ui, &label, false, 14.0, 10.0).clicked() {
+                            audio_action = Some(AudioAction::PlaySurah(screen_s));
+                        }
+                    }
+                    if selected_s.is_some() {
+                        ui.weak("Download follows the verse you last tapped.");
                     }
                     if ui
                         .checkbox(&mut self.audio_single, "Play one verse only")
@@ -2758,7 +3046,7 @@ impl QuranApp {
         if reciter_changed {
             // The audio on the phone belongs to the old reciter: stop it and re-check.
             self.stop_audio();
-            self.audio_ready_cache.2 = -10.0;
+            self.audio_ready_reset();
             self.dirty = true;
         }
         if marks_changed {
@@ -2780,6 +3068,9 @@ impl QuranApp {
         if let Some(i) = start_tafsir {
             self.start_tafsir_download(i);
         }
+        if ask_delete.is_some() {
+            self.confirm_delete = ask_delete;
+        }
         if let Some(act) = audio_action {
             self.run_audio_action(ctx, act);
         }
@@ -2791,7 +3082,7 @@ impl QuranApp {
             }
         }
         if let Some(g) = jump {
-            self.jump_to_verse(g);
+            self.open_search_result(g);
         }
     }
 
@@ -3029,6 +3320,14 @@ impl QuranApp {
             self.ensure_layout(ui.ctx(), s);
             self.compute_tops();
             vp_top = self.tops[s] + self.verse_offset(s, v);
+            // A tapped search result is centred on the screen instead of put at the top.
+            if let (Some(vi), Some((cs, cv))) = (v, self.center_jump) {
+                if cs == s && cv == vi {
+                    let h = self.verse_height(s, vi).min(view_h);
+                    vp_top = (vp_top - (view_h - h) * 0.5).max(0.0);
+                }
+            }
+            self.center_jump = None;
             forced = Some(vp_top);
         } else if scroll_delta != 0.0 {
             vp_top = (self.last_offset + scroll_delta).max(0.0);
@@ -3388,10 +3687,11 @@ impl QuranApp {
             }
         }
         // Tapping a verse plays its audio (when it has been downloaded), but only
-        // while "Play one verse only" is ticked in the sidebar Audio menu.
+        // while "Play one verse only" is ticked in the sidebar Audio menu. A surah that is
+        // already playing is not stopped by it (see `tap_play`).
         if let (Some(g), true) = (tapped, self.audio_single) {
             let ctx2 = ui.ctx().clone();
-            self.play_audio(&ctx2, g as u32, false);
+            self.tap_play(&ctx2, g as u32);
         }
 
         if let Some(g) = opened {
@@ -3467,7 +3767,7 @@ impl QuranApp {
             self.select_surah(s);
         }
         if let Some(g) = pick_verse {
-            self.jump_to_verse(g);
+            self.open_search_result(g);
         }
     }
 }
@@ -3511,6 +3811,199 @@ fn kbd_key(ui: &mut egui::Ui, size: egui::Vec2, label: &str, font: FontId) -> bo
 }
 
 /// A small keyboard icon centred on `c`.
+/// A round button with a drawn icon (no font needed). `color` overrides the icon colour
+/// (e.g. yellow for a bookmarked verse); `paint` draws the icon inside the given rect.
+fn icon_button(
+    ui: &mut egui::Ui,
+    color: Option<Color32>,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) -> egui::Response {
+    icon_button_sized(ui, egui::vec2(40.0, 32.0), color, paint)
+}
+
+/// Same as `icon_button`, with a chosen size (32 x 32 makes a circle).
+fn icon_button_sized(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    color: Option<Color32>,
+    paint: impl FnOnce(&egui::Painter, egui::Rect, Color32),
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let visuals = ui.style().interact_selectable(&resp, false);
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(255),
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0));
+    paint(ui.painter(), icon_rect, color.unwrap_or(visuals.text_color()));
+    resp
+}
+
+/// Download icon: an arrow pointing down into a tray.
+fn paint_download_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(1.8, c);
+    let cx = r.center().x;
+    p.line_segment(
+        [egui::pos2(cx, r.top() + 1.0), egui::pos2(cx, r.bottom() - 6.0)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx - 5.0, r.bottom() - 10.5), egui::pos2(cx, r.bottom() - 5.5)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx + 5.0, r.bottom() - 10.5), egui::pos2(cx, r.bottom() - 5.5)],
+        stroke,
+    );
+    p.line_segment(
+        [
+            egui::pos2(r.left() + 2.0, r.bottom() - 1.0),
+            egui::pos2(r.right() - 2.0, r.bottom() - 1.0),
+        ],
+        stroke,
+    );
+}
+
+/// Bin icon (delete).
+fn paint_trash_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(1.7, c);
+    let cx = r.center().x;
+    // lid and handle
+    p.line_segment(
+        [egui::pos2(r.left() + 1.5, r.top() + 4.0), egui::pos2(r.right() - 1.5, r.top() + 4.0)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx - 2.5, r.top() + 1.5), egui::pos2(cx + 2.5, r.top() + 1.5)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx - 2.5, r.top() + 1.5), egui::pos2(cx - 2.5, r.top() + 4.0)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx + 2.5, r.top() + 1.5), egui::pos2(cx + 2.5, r.top() + 4.0)],
+        stroke,
+    );
+    // body, slightly narrower at the bottom
+    p.add(egui::Shape::closed_line(
+        vec![
+            egui::pos2(r.left() + 3.0, r.top() + 5.5),
+            egui::pos2(r.right() - 3.0, r.top() + 5.5),
+            egui::pos2(r.right() - 4.0, r.bottom() - 0.5),
+            egui::pos2(r.left() + 4.0, r.bottom() - 0.5),
+        ],
+        stroke,
+    ));
+    p.line_segment(
+        [egui::pos2(cx, r.top() + 8.0), egui::pos2(cx, r.bottom() - 3.0)],
+        Stroke::new(1.2, c),
+    );
+}
+
+/// Update icon: a circular arrow (a newer version is online).
+fn paint_update_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(1.8, c);
+    let ctr = r.center();
+    let rad = 6.5;
+    let pts: Vec<Pos2> = (0..=10)
+        .map(|k| {
+            let a = (50.0 + 260.0 * k as f32 / 10.0).to_radians();
+            egui::pos2(ctr.x + rad * a.cos(), ctr.y - rad * a.sin())
+        })
+        .collect();
+    let end = pts[pts.len() - 1];
+    p.add(egui::Shape::line(pts, stroke));
+    // arrow head at the end of the arc
+    p.line_segment([end, egui::pos2(end.x - 5.0, end.y - 1.0)], stroke);
+    p.line_segment([end, egui::pos2(end.x - 1.5, end.y - 5.5)], stroke);
+}
+
+/// Cancel icon: a cross.
+fn paint_cancel_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(1.9, c);
+    let q = r.shrink(3.5);
+    p.line_segment([q.left_top(), q.right_bottom()], stroke);
+    p.line_segment([q.right_top(), q.left_bottom()], stroke);
+}
+
+/// Tick icon (downloaded).
+fn paint_check_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(2.2, c);
+    let a = egui::pos2(r.left() + 2.0, r.center().y + 1.0);
+    let b = egui::pos2(r.center().x - 1.5, r.bottom() - 3.5);
+    let d = egui::pos2(r.right() - 1.0, r.top() + 4.0);
+    p.line_segment([a, b], stroke);
+    p.line_segment([b, d], stroke);
+}
+
+/// Share icon: three dots joined by two lines.
+fn paint_share_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(1.6, c);
+    let a = egui::pos2(r.left() + 3.0, r.center().y);
+    let b = egui::pos2(r.right() - 3.0, r.top() + 3.5);
+    let d = egui::pos2(r.right() - 3.0, r.bottom() - 3.5);
+    p.line_segment([a, b], stroke);
+    p.line_segment([a, d], stroke);
+    for pt in [a, b, d] {
+        p.circle_filled(pt, 3.0, c);
+    }
+}
+
+/// "Top of the surah" icon: an arrow pointing up to a bar.
+fn paint_top_icon(p: &egui::Painter, r: egui::Rect, c: Color32) {
+    let stroke = Stroke::new(1.8, c);
+    let cx = r.center().x;
+    p.line_segment(
+        [
+            egui::pos2(r.left() + 2.0, r.top() + 1.5),
+            egui::pos2(r.right() - 2.0, r.top() + 1.5),
+        ],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx, r.bottom() - 1.5), egui::pos2(cx, r.top() + 5.5)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx - 5.5, r.top() + 11.0), egui::pos2(cx, r.top() + 5.5)],
+        stroke,
+    );
+    p.line_segment(
+        [egui::pos2(cx + 5.5, r.top() + 11.0), egui::pos2(cx, r.top() + 5.5)],
+        stroke,
+    );
+}
+
+/// Bookmark ribbon (Giteleke). Filled when the verse is bookmarked.
+fn paint_bookmark_icon(p: &egui::Painter, r: egui::Rect, c: Color32, filled: bool) {
+    let xc = r.center().x;
+    let (x0, x1) = (xc - 5.5, xc + 5.5);
+    let (y0, y1) = (r.top() + 0.5, r.bottom() - 0.5);
+    let tl = egui::pos2(x0, y0);
+    let tr = egui::pos2(x1, y0);
+    let br = egui::pos2(x1, y1);
+    let bl = egui::pos2(x0, y1);
+    let mid = egui::pos2(xc, y1 - 5.0);
+    if filled {
+        // The notched ribbon is not convex, so it is filled as two convex halves.
+        p.add(egui::Shape::convex_polygon(
+            vec![tl, egui::pos2(xc, y0), mid, bl],
+            c,
+            Stroke::NONE,
+        ));
+        p.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(xc, y0), tr, br, mid],
+            c,
+            Stroke::NONE,
+        ));
+    }
+    p.add(egui::Shape::closed_line(vec![tl, tr, br, mid, bl], Stroke::new(1.6, c)));
+}
+
 fn paint_keyboard_icon(p: &egui::Painter, c: Pos2, color: Color32) {
     let body = egui::Rect::from_center_size(c, egui::vec2(20.0, 13.0));
     p.rect_stroke(
@@ -3838,10 +4331,21 @@ impl QuranApp {
             .resizable(true)
             .collapsible(false)
             .default_width((screen.width() * 0.84).min(440.0))
+            // The dialog never grows taller than this, however long the verse is.
+            .max_height(screen.height() * 0.9)
             .frame(theme::window_frame(th))
             .show(ctx, |ui| {
                 ui.label(RichText::new(st.title.as_str()).strong());
-                arabic_block(ui, &st.shaped_ar, &ar_font, text_color);
+                // Long verses (e.g. 2:282) scroll inside their own area instead of
+                // stretching the dialog. Keep this limit and the translation limit below
+                // small enough that, together with the buttons, they fit in `max_height`.
+                egui::ScrollArea::vertical()
+                    .id_salt("verse_menu_arabic")
+                    .max_height(screen.height() * 0.28)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        arabic_block(ui, &st.shaped_ar, &ar_font, text_color);
+                    });
                 ui.separator();
 
                 egui::ScrollArea::vertical()
@@ -3907,30 +4411,37 @@ impl QuranApp {
                 }
 
                 ui.separator();
-                // One single row of compact buttons, aligned to the right.
+                // One single row, aligned to the right. Top, Giteleke (bookmark) and
+                // Share are drawn icons; Tafsir and close stay text pills.
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        // Opens Android's share sheet (rename the label here if you like).
-                        let share_label = "Share";
-                        let mark_label = if is_marked { "Remove" } else { "Giteleke" };
+                        ui.spacing_mut().item_spacing.x = 6.0;
                         let close_label = "\u{3a7}";
-                        let labels = [share_label, "Tafsir", mark_label, "Top", close_label];
+                        let labels = ["Tafsir", close_label];
                         let (fs, pad) = fit_button_row(ui, &labels, 4.0);
                         // Added right-to-left, so this reads Share, Tafsir, Giteleke, Top, X.
                         if pill_button(ui, close_label, false, fs, pad).clicked() {
                             close = true;
                         }
-                        if pill_button(ui, "Top", false, fs, pad).clicked() {
+                        if icon_button(ui, None, paint_top_icon).clicked() {
                             do_surah_top = true;
                         }
-                        if pill_button(ui, mark_label, false, fs, pad).clicked() {
+                        // Giteleke: turns yellow (and filled) once the verse is bookmarked.
+                        let yellow = if is_marked {
+                            Some(Color32::from_rgb(255, 193, 7))
+                        } else {
+                            None
+                        };
+                        if icon_button(ui, yellow, |p, r, c| paint_bookmark_icon(p, r, c, is_marked))
+                            .clicked()
+                        {
                             do_bookmark = true;
                         }
                         if pill_button(ui, "Tafsir", st.show_tafsir, fs, pad).clicked() {
                             st.show_tafsir = !st.show_tafsir;
                         }
-                        if pill_button(ui, share_label, false, fs, pad).clicked() {
+                        // Opens Android's share sheet.
+                        if icon_button(ui, None, paint_share_icon).clicked() {
                             do_share = true;
                         }
                     });
