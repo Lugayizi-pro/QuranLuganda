@@ -219,7 +219,7 @@ pub fn set_app(app: winit::platform::android::activity::AndroidApp) {
     platform::set_app(app);
 }
 
-pub use platform::{clipboard_text, download, share_text, Player};
+pub use platform::{clipboard_text, download, keyboard_height_px, share_text, Player};
 
 #[cfg(target_os = "android")]
 mod platform {
@@ -238,6 +238,57 @@ mod platform {
     }
 
     /// Opens Android's share sheet with `text` as plain text.
+    /// Height of the on-screen keyboard in physical pixels (0 when it is hidden).
+    ///
+    /// Android does not tell a native app how tall its keyboard is, so this compares the
+    /// visible part of the window with the whole window. The very first call records the
+    /// "no keyboard" value (system bars included), so call it once while the keyboard is
+    /// hidden, at start-up.
+    pub fn keyboard_height_px() -> i32 {
+        static BASE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+        let (Some(vm), Some(app)) = (VM.get(), APP.get()) else {
+            return 0;
+        };
+        let Ok(mut env) = vm.attach_current_thread() else {
+            return 0;
+        };
+        let raw = (|| -> jni::errors::Result<i32> {
+            let activity = unsafe { JObject::from_raw(app.activity_as_ptr() as jni::sys::jobject) };
+            let window = env
+                .call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?
+                .l()?;
+            let decor = env
+                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+                .l()?;
+            let rect = env.new_object("android/graphics/Rect", "()V", &[])?;
+            env.call_method(
+                &decor,
+                "getWindowVisibleDisplayFrame",
+                "(Landroid/graphics/Rect;)V",
+                &[JValue::Object(&rect)],
+            )?;
+            let bottom = env.get_field(&rect, "bottom", "I")?.i()?;
+            let root = env
+                .call_method(&decor, "getRootView", "()Landroid/view/View;", &[])?
+                .l()?;
+            let height = env.call_method(&root, "getHeight", "()I", &[])?.i()?;
+            Ok(height - bottom)
+        })();
+        let raw = match raw {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = env.exception_clear();
+                return 0;
+            }
+        };
+        let base = BASE.load(std::sync::atomic::Ordering::Relaxed);
+        if base == i32::MIN || raw < base {
+            BASE.store(raw, std::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        (raw - base).max(0)
+    }
+
     pub fn share_text(text: &str) -> Result<(), String> {
         let app = APP.get().ok_or_else(|| "sharing is not ready".to_string())?;
         let vm = VM.get().ok_or_else(|| "sharing is not ready".to_string())?;
@@ -566,6 +617,10 @@ mod platform {
 
     pub fn download(_url: &str, _dest: &Path, _cancel: &AtomicBool) -> Result<bool, String> {
         Err("audio downloads only work on Android".to_string())
+    }
+
+    pub fn keyboard_height_px() -> i32 {
+        0
     }
 
     pub fn share_text(_text: &str) -> Result<(), String> {

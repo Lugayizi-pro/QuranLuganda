@@ -869,11 +869,9 @@ mod tests {
             tagged.chars().filter(|&c| !is_tag(c)).collect::<String>(),
             plain
         );
-        assert!(
-            tagged
-                .chars()
-                .any(|c| decode_tag(c) == Some((super::tj::GHUNNA, false)))
-        );
+        assert!(tagged
+            .chars()
+            .any(|c| decode_tag(c) == Some((super::tj::GHUNNA, false))));
     }
 
     #[test]

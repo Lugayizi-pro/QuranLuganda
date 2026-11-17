@@ -147,6 +147,7 @@ const MAX_TRANS: f32 = 32.0;
 enum DeleteTarget {
     Translation(usize),
     Tafsir(usize),
+    Wbw(usize),
 }
 
 enum AudioAction {
@@ -286,6 +287,17 @@ impl SurahLayout {
                     base,
                     width: 0.0,
                 });
+                // The opening letters (ق، ن، الر ...) are a verse of their own: close
+                // them with their own number marker (start == end == 1 marks this one).
+                if verses[v].ayah == 1 && data::letters_split(verses[v].surah) && items.len() as u32 == first + 1 {
+                    items.push(FlowItem {
+                        verse: v as u32,
+                        start: 1,
+                        end: 1,
+                        base: 0.0,
+                        width: 0.0,
+                    });
+                }
             }
             items.push(FlowItem {
                 verse: v as u32,
@@ -471,7 +483,11 @@ pub struct LongPressContext {
     pub title: String,
     pub shaped_ar: String,
     pub show_tafsir: bool,
+    /// Word of the Arabic that was long-pressed (index in reading order).
+    word_sel: Option<usize>,
+    word_press: PressTracker,
 }
+
 
 #[derive(Default)]
 struct PressTracker {
@@ -579,6 +595,13 @@ pub struct QuranApp {
 
     press: PressTracker,
     long_press_state: Option<LongPressContext>,
+    /// Per translation: are its word-by-word meanings on the phone?
+    wbw_ready: Vec<bool>,
+    /// Per translation: a newer word-meaning file is available online.
+    wbw_update: Vec<bool>,
+    wbw_dl: std::sync::Arc<std::sync::Mutex<TransDl>>,
+    /// Last word-meaning download problem.
+    wbw_msg: Option<String>,
     bookmarks: Vec<Bookmark>,
 
     arabic_family: FontFamily,
@@ -698,7 +721,10 @@ impl QuranApp {
                 meta: format!(
                     "{} \u{b7} {} verses",
                     s.english,
-                    if s.number == 1 || s.number == 9 { s.verses } else { s.verses + 1 }
+                    {
+                        let bismillah = if s.number == 1 || s.number == 9 { 0 } else { 1 };
+                        s.verses + bismillah + data::letters_split(s.number) as u16
+                    }
                 ),
                 arabic: arabic::shape_line(s.arabic, false),
             })
@@ -760,6 +786,10 @@ impl QuranApp {
             search_status: String::new(),
             press: PressTracker::default(),
             long_press_state: None,
+            wbw_ready: vec![false; TRANSLATIONS.len()],
+            wbw_update: vec![false; TRANSLATIONS.len()],
+            wbw_dl: Default::default(),
+            wbw_msg: None,
             bookmarks: Vec::new(),
             arabic_family,
             arabic_size: 25.0,
@@ -805,7 +835,7 @@ impl QuranApp {
             audio_oneshot: false,
             audio_resume: None,
             reciter: 0,
-            show_tajweed: false,
+            show_tajweed: true,
             sidebar_section: None,
             surah_list_offset: 0.0,
             guide_page: None,
@@ -830,6 +860,7 @@ impl QuranApp {
         theme::apply(&cc.egui_ctx, app.theme);
         app.load_downloaded_translations();
         app.load_downloaded_tafsirs();
+        app.load_downloaded_wbw();
         app.recompute_est_trans();
         if !app.guide_seen {
             app.guide_page = Some(0);
@@ -1036,6 +1067,14 @@ impl QuranApp {
                 self.tafsir_ready[i] = false;
                 self.tafsir_update[i] = false;
             }
+            DeleteTarget::Wbw(i) => {
+                if let Some(dir) = &dir {
+                    let _ = std::fs::remove_file(dir.join(TRANSLATIONS[i].wbw_file));
+                }
+                self.data.clear_wbw(i);
+                self.wbw_ready[i] = false;
+                self.wbw_update[i] = false;
+            }
         }
         self.dirty = true;
     }
@@ -1048,6 +1087,7 @@ impl QuranApp {
         let (name, what) = match target {
             DeleteTarget::Translation(i) => (TRANSLATIONS[i].name, "translation"),
             DeleteTarget::Tafsir(i) => (TRANSLATIONS[i].name, "tafsir"),
+            DeleteTarget::Wbw(i) => (TRANSLATIONS[i].name, "word meanings"),
         };
         let th = self.theme;
         let screen = ctx.content_rect();
@@ -1133,6 +1173,111 @@ impl QuranApp {
                 }
             }
         }
+    }
+
+    /// Reads the word-meaning files downloaded in an earlier run.
+    fn load_downloaded_wbw(&mut self) {
+        if let Some(dir) = translations_dir() {
+            for (i, src) in TRANSLATIONS.iter().enumerate() {
+                if let Ok(text) = std::fs::read_to_string(dir.join(src.wbw_file)) {
+                    self.wbw_ready[i] = self.data.set_wbw_text(i, text);
+                }
+            }
+        }
+    }
+
+    /// Starts downloading the word meanings of translation `i` in the background.
+    fn start_wbw_download(&mut self, i: usize) {
+        let Some(src) = TRANSLATIONS.get(i) else {
+            return;
+        };
+        if self.wbw_ready[i] && !self.wbw_update[i] {
+            return;
+        }
+        let Some(dir) = translations_dir() else {
+            self.wbw_msg = Some("No storage folder to save the word meanings in.".to_string());
+            return;
+        };
+        {
+            let Ok(mut g) = self.wbw_dl.lock() else {
+                return;
+            };
+            if g.active.is_some() {
+                return; // one download at a time
+            }
+            g.active = Some(i);
+            g.done = None;
+        }
+        self.wbw_msg = None;
+        let url = src.wbw_url();
+        // Saved next to the old file first, so a failed update never breaks it.
+        let dest = dir.join(format!("{}.new", src.wbw_file));
+        let key = src.wbw_key();
+        let shared = self.wbw_dl.clone();
+        std::thread::spawn(move || {
+            let version = fetch_remote_versions(&dir)
+                .and_then(|m| m.get(&key).copied())
+                .unwrap_or(1);
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let result = match audio::download(&url, &dest, &cancel) {
+                Ok(true) => Ok((dest, version)),
+                Ok(false) => Err("cancelled".to_string()),
+                Err(e) => Err(e),
+            };
+            if let Ok(mut g) = shared.lock() {
+                g.active = None;
+                g.done = Some((i, result));
+            }
+        });
+    }
+
+    /// Picks up a finished word-meaning download / update check (called every frame).
+    fn poll_wbw(&mut self, ctx: &egui::Context) {
+        let (active, done, updates) = match self.wbw_dl.lock() {
+            Ok(mut g) => (g.active, g.done.take(), g.updates.take()),
+            Err(_) => return,
+        };
+        if active.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(300));
+        }
+        if let Some(list) = updates {
+            for i in list {
+                if self.wbw_ready[i] {
+                    self.wbw_update[i] = true;
+                }
+            }
+            ctx.request_repaint();
+        }
+        let Some((i, result)) = done else {
+            return;
+        };
+        let name = TRANSLATIONS[i].name;
+        match result {
+            Ok((path, version)) => {
+                let ok = std::fs::read_to_string(&path)
+                    .map(|text| self.data.set_wbw_text(i, text))
+                    .unwrap_or(false);
+                let dir = translations_dir();
+                match (ok, &dir) {
+                    (true, Some(dir)) => {
+                        // The new file replaces the old one only now that it is known to be good.
+                        let _ = std::fs::rename(&path, dir.join(TRANSLATIONS[i].wbw_file));
+                        write_local_version(dir, &TRANSLATIONS[i].wbw_key(), version);
+                        self.wbw_ready[i] = true;
+                        self.wbw_update[i] = false;
+                        self.wbw_msg = None;
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&path);
+                        self.wbw_msg = Some(format!(
+                            "The {name} word-meaning file that arrived is not valid. Check its name in the release."
+                        ));
+                    }
+                }
+            }
+            Err(e) => self.wbw_msg = Some(format!("Could not download the {name} word meanings: {e}")),
+        }
+        ctx.request_repaint();
     }
 
     /// Starts downloading the tafsir of translation `i` in the background.
@@ -1293,7 +1438,8 @@ impl QuranApp {
             .iter()
             .enumerate()
             .any(|(i, t)| !t.is_bundled() && self.trans_ready[i])
-            || self.tafsir_ready.iter().any(|r| *r);
+            || self.tafsir_ready.iter().any(|r| *r)
+            || self.wbw_ready.iter().any(|r| *r);
         let Some(dir) = translations_dir() else {
             return;
         };
@@ -1302,6 +1448,7 @@ impl QuranApp {
         }
         let shared = self.trans_dl.clone();
         let tafsir_shared = self.tafsir_dl.clone();
+        let wbw_shared = self.wbw_dl.clone();
         std::thread::spawn(move || {
             let Some(remote) = fetch_remote_versions(&dir) else {
                 return; // no version file online, or no internet: nothing to do
@@ -1330,6 +1477,18 @@ impl QuranApp {
                 .collect();
             if let Ok(mut g) = tafsir_shared.lock() {
                 g.updates = Some(newer_tafsir);
+            }
+            let newer_wbw: Vec<usize> = TRANSLATIONS
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    let key = t.wbw_key();
+                    remote.get(&key).copied().unwrap_or(0) > local.get(&key).copied().unwrap_or(1)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if let Ok(mut g) = wbw_shared.lock() {
+                g.updates = Some(newer_wbw);
             }
         });
     }
@@ -1859,6 +2018,35 @@ fn fit_button_row(ui: &egui::Ui, labels: &[&str], gap: f32) -> (f32, f32) {
     }
 }
 
+/// A row of buttons, added left to right. While everything fits it sits at the right edge;
+/// when there are more buttons than the width allows it scrolls sideways (no scroll bar).
+fn scroll_row(ui: &mut egui::Ui, key: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let id = ui.id().with(key);
+    let avail = ui.available_width();
+    // Width the buttons needed last frame (0 the first time).
+    let last: f32 = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    egui::ScrollArea::horizontal()
+        .id_salt(id)
+        .auto_shrink([false, true])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                // Everything fits: push the buttons to the right edge.
+                if last > 0.0 && last < avail {
+                    ui.add_space(avail - last);
+                }
+                let x0 = ui.cursor().left();
+                add(ui);
+                let width = ui.min_rect().right() - x0;
+                if (width - last).abs() > 0.5 {
+                    ui.data_mut(|d| d.insert_temp(id, width));
+                    ui.ctx().request_repaint();
+                }
+            });
+        });
+}
+
 /// A round (pill) button whose text is placed on whole pixels, so small text
 /// stays sharp and always sits fully inside the button.
 // ---- First-use guide -----------------------------------------------------------
@@ -2181,6 +2369,7 @@ impl eframe::App for QuranApp {
             self.recompute_search();
         }
         self.poll_translation_download(ctx);
+        self.poll_wbw(ctx);
         self.handle_back(ctx);
         self.sidebar_swipe(ctx);
         self.audio_tick(ctx);
@@ -2741,6 +2930,7 @@ impl QuranApp {
         let mut start_download: Option<usize> = None;
         let mut start_tafsir: Option<usize> = None;
         let mut ask_delete: Option<DeleteTarget> = None;
+        let mut start_wbw: Option<usize> = None;
         let mut audio_action: Option<AudioAction> = None;
         let mut reciter_changed = false;
         let mut show_guide = false;
@@ -2772,6 +2962,7 @@ impl QuranApp {
             section(ui, &mut sidebar_section, 0, "Translation", |ui| {
                     let downloading = self.trans_dl.lock().ok().and_then(|g| g.active);
                     let tafsir_busy = self.tafsir_dl.lock().ok().and_then(|g| g.active);
+                    let wbw_busy = self.wbw_dl.lock().ok().and_then(|g| g.active);
                     for (i, t) in TRANSLATIONS.iter().enumerate() {
                         let label = if t.language.is_empty() {
                             t.name.to_owned()
@@ -2796,7 +2987,29 @@ impl QuranApp {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let round = egui::vec2(28.0, 28.0);
                                 let orange = Color32::from_rgb(230, 140, 40);
-                                // Tafsir (only for a translation that is on the phone): rightmost.
+                                // Word-by-word meanings (only for a translation that is on the
+                                // phone): rightmost.
+                                if self.trans_ready[i] {
+                                    if wbw_busy == Some(i) {
+                                        ui.add(egui::Spinner::new().size(18.0));
+                                    } else if self.wbw_ready[i] && self.wbw_update[i] {
+                                        if icon_button_sized(ui, round, Some(orange), paint_update_icon).clicked()
+                                            && wbw_busy.is_none()
+                                        {
+                                            start_wbw = Some(i);
+                                        }
+                                    } else if self.wbw_ready[i] {
+                                        if icon_button_sized(ui, round, None, paint_trash_icon).clicked() {
+                                            ask_delete = Some(DeleteTarget::Wbw(i));
+                                        }
+                                    } else if icon_button_sized(ui, round, None, paint_download_icon).clicked()
+                                        && wbw_busy.is_none()
+                                    {
+                                        start_wbw = Some(i);
+                                    }
+                                    ui.label(RichText::new("Words").small().weak());
+                                }
+                                // Tafsir (only for a translation that is on the phone).
                                 if self.trans_ready[i] {
                                     if tafsir_busy == Some(i) {
                                         ui.add(egui::Spinner::new().size(18.0));
@@ -2850,6 +3063,9 @@ impl QuranApp {
                         ui.colored_label(Color32::from_rgb(220, 120, 40), msg.as_str());
                     }
                     if let Some(msg) = &self.tafsir_msg {
+                        ui.colored_label(Color32::from_rgb(220, 120, 40), msg.as_str());
+                    }
+                    if let Some(msg) = &self.wbw_msg {
                         ui.colored_label(Color32::from_rgb(220, 120, 40), msg.as_str());
                     }
                     if !self.show_translation {
@@ -3067,6 +3283,9 @@ impl QuranApp {
         }
         if let Some(i) = start_tafsir {
             self.start_tafsir_download(i);
+        }
+        if let Some(i) = start_wbw {
+            self.start_wbw_download(i);
         }
         if ask_delete.is_some() {
             self.confirm_delete = ask_delete;
@@ -3704,6 +3923,8 @@ impl QuranApp {
                     title: format!("{} {}:{}", SURAHS[s].translit, v.surah, v.num),
                     shaped_ar: lay.shaped[i].clone(),
                     show_tafsir: false,
+                    word_sel: None,
+                    word_press: PressTracker::default(),
                 });
             }
         }
@@ -4291,6 +4512,7 @@ impl QuranApp {
         let tr = self.data.translation(self.translation_idx, st.global as usize);
         let tr_idx = self.translation_idx;
         let tr_name = self.current_translation().name;
+        let trans_size = self.trans_size;
         // The tafsir that goes with the selected translation.
         let tafsir_text = self.data.tafsir(tr_idx, st.global as usize);
         let tafsir_have = self.tafsir_ready[tr_idx];
@@ -4308,6 +4530,12 @@ impl QuranApp {
         let mut do_share = false;
         let mut do_bookmark = false;
         let mut do_surah_top = false;
+        let n_words = st.shaped_ar.split(' ').count();
+        // The word meanings that go with the selected translation.
+        let wbw_have = self.wbw_ready[tr_idx];
+        let wbw_line = self.data.wbw(tr_idx, st.global as usize);
+        let wbw_busy = self.wbw_dl.lock().ok().and_then(|g| g.active);
+        let mut start_wbw: Option<usize> = None;
 
         egui::Area::new(egui::Id::new("verse_scrim"))
             .order(egui::Order::Middle)
@@ -4344,8 +4572,94 @@ impl QuranApp {
                     .max_height(screen.height() * 0.28)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        arabic_block(ui, &st.shaped_ar, &ar_font, text_color);
+                        // Long-press a word to see what it means (word by word).
+                        let hl: Vec<bool> = (0..n_words).map(|j| st.word_sel == Some(j)).collect();
+                        if let Some(j) = arabic_block_words(
+                            ui,
+                            &st.shaped_ar,
+                            &ar_font,
+                            text_color,
+                            &hl,
+                            theme::accent(th).gamma_multiply(0.4),
+                            &mut st.word_press,
+                        ) {
+                            st.word_sel = Some(j);
+                        }
                     });
+                // The meaning of the long-pressed word.
+                match st.word_sel {
+                    None => {
+                        ui.label(RichText::new("Long-press a word for its meaning.").small().weak());
+                    }
+                    Some(j) => {
+                        if wbw_have {
+                            // One meaning per word, separated by ';', in reading order.
+                            let mut meanings: Vec<&str> = wbw_line.split(';').map(|w| w.trim()).collect();
+                            // A ';' at the very end of the line is allowed.
+                            if meanings.len() == n_words + 1 && meanings.last() == Some(&"") {
+                                meanings.pop();
+                            }
+                            // Meanings that are really there (empty slots left out).
+                            let rough: Vec<&str> = meanings.iter().copied().filter(|m| !m.is_empty()).collect();
+                            if rough.is_empty() {
+                                ui.weak("Word meanings are not available for this verse.");
+                            } else if meanings.len() == n_words {
+                                // Exact: one meaning per word. An empty slot means "this word
+                                // belongs to the phrase of the word before": show that phrase.
+                                let text = if meanings[j].is_empty() {
+                                    match meanings[..j].iter().rposition(|m| !m.is_empty()) {
+                                        Some(k) => format!("{} (with word {})", meanings[k], k + 1),
+                                        None => String::new(),
+                                    }
+                                } else {
+                                    meanings[j].to_string()
+                                };
+                                ui.label(
+                                    RichText::new(format!("{}. {}", j + 1, text))
+                                        .strong()
+                                        .color(trans_color),
+                                );
+                            } else {
+                                // The count does not match the words of the verse. Instead of
+                                // giving up, spread the meanings evenly over the words: with
+                                // fewer meanings several words share one, with more meanings
+                                // a word shows its share of them. It is only a guess.
+                                let (m, n) = (rough.len(), n_words.max(1));
+                                let start = (j * m / n).min(m - 1);
+                                let end = ((j + 1) * m / n).max(start + 1).min(m);
+                                let text = rough[start..end].join(" ");
+                                ui.label(
+                                    RichText::new(format!("{}. {}", j + 1, text))
+                                        .strong()
+                                        .color(trans_color),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Approximate: this verse has {m} meanings for {n} words."
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        } else if wbw_busy == Some(tr_idx) {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(16.0));
+                                ui.weak(format!("Downloading the {tr_name} word meanings..."));
+                            });
+                        } else {
+                            ui.weak(format!("The {tr_name} word meanings are not on the phone yet."));
+                            if ui
+                                .add_enabled(wbw_busy.is_none(), egui::Button::new("Download word meanings"))
+                                .clicked()
+                            {
+                                start_wbw = Some(tr_idx);
+                            }
+                            if let Some(m) = &self.wbw_msg {
+                                ui.colored_label(Color32::from_rgb(220, 120, 40), m.as_str());
+                            }
+                        }
+                    }
+                }
                 ui.separator();
 
                 egui::ScrollArea::vertical()
@@ -4356,7 +4670,8 @@ impl QuranApp {
                             ui.weak("No translation loaded for this verse.");
                         } else {
                             ui.label(RichText::new(tr_name).small().weak());
-                            ui.label(RichText::new(tr).color(trans_color));
+                            // Same size as the "Translation size" slider in Reader settings.
+                            ui.label(RichText::new(tr).size(trans_size).color(trans_color));
                         }
                         if st.show_tafsir {
                             ui.separator();
@@ -4388,63 +4703,50 @@ impl QuranApp {
 
                 if self.trans_ready.iter().filter(|r| **r).count() > 1 {
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let names: Vec<&str> = TRANSLATIONS
-                                .iter()
-                                .enumerate()
-                                .filter(|(i, _)| self.trans_ready[*i])
-                                .map(|(_, t)| t.name)
-                                .collect();
-                            let (fs, pad) = fit_button_row(ui, &names, 4.0);
-                            for (i, t) in TRANSLATIONS.iter().enumerate().rev() {
-                                if !self.trans_ready[i] {
-                                    continue;
-                                }
-                                if pill_button(ui, t.name, i == tr_idx, fs, pad).clicked() {
-                                    pick_tr = Some(i);
-                                }
+                    // Scrolls sideways if more translations are added than fit.
+                    scroll_row(ui, "translation_row", |ui| {
+                        let fs = system_button_font(ui).size.round();
+                        for (i, t) in TRANSLATIONS.iter().enumerate() {
+                            if !self.trans_ready[i] {
+                                continue;
                             }
-                        });
+                            if pill_button(ui, t.name, i == tr_idx, fs, 10.0).clicked() {
+                                pick_tr = Some(i);
+                            }
+                        }
                     });
                 }
 
                 ui.separator();
-                // One single row, aligned to the right. Top, Giteleke (bookmark) and
-                // Share are drawn icons; Tafsir and close stay text pills.
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let close_label = "\u{3a7}";
-                        let labels = ["Tafsir", close_label];
-                        let (fs, pad) = fit_button_row(ui, &labels, 4.0);
-                        // Added right-to-left, so this reads Share, Tafsir, Giteleke, Top, X.
-                        if pill_button(ui, close_label, false, fs, pad).clicked() {
-                            close = true;
-                        }
-                        if icon_button(ui, None, paint_top_icon).clicked() {
-                            do_surah_top = true;
-                        }
-                        // Giteleke: turns yellow (and filled) once the verse is bookmarked.
-                        let yellow = if is_marked {
-                            Some(Color32::from_rgb(255, 193, 7))
-                        } else {
-                            None
-                        };
-                        if icon_button(ui, yellow, |p, r, c| paint_bookmark_icon(p, r, c, is_marked))
-                            .clicked()
-                        {
-                            do_bookmark = true;
-                        }
-                        if pill_button(ui, "Tafsir", st.show_tafsir, fs, pad).clicked() {
-                            st.show_tafsir = !st.show_tafsir;
-                        }
-                        // Opens Android's share sheet.
-                        if icon_button(ui, None, paint_share_icon).clicked() {
-                            do_share = true;
-                        }
-                    });
+                // One row at the right edge; it scrolls sideways if more buttons are added
+                // than fit. Share, Top and Giteleke (bookmark) are drawn icons; Tafsir and
+                // close stay text pills. Added left to right.
+                scroll_row(ui, "action_row", |ui| {
+                    let fs = system_button_font(ui).size.round();
+                    // Opens Android's share sheet.
+                    if icon_button(ui, None, paint_share_icon).clicked() {
+                        do_share = true;
+                    }
+                    if pill_button(ui, "Tafsir", st.show_tafsir, fs, 10.0).clicked() {
+                        st.show_tafsir = !st.show_tafsir;
+                    }
+                    // Giteleke: turns yellow (and filled) once the verse is bookmarked.
+                    let yellow = if is_marked {
+                        Some(Color32::from_rgb(255, 193, 7))
+                    } else {
+                        None
+                    };
+                    if icon_button(ui, yellow, |p, r, c| paint_bookmark_icon(p, r, c, is_marked))
+                        .clicked()
+                    {
+                        do_bookmark = true;
+                    }
+                    if icon_button(ui, None, paint_top_icon).clicked() {
+                        do_surah_top = true;
+                    }
+                    if pill_button(ui, "\u{3a7}", false, fs, 10.0).clicked() {
+                        close = true;
+                    }
                 });
             });
 
@@ -4467,6 +4769,9 @@ impl QuranApp {
             if let Err(e) = audio::share_text(&text) {
                 self.toast(ctx, e);
             }
+        }
+        if let Some(i) = start_wbw {
+            self.start_wbw_download(i);
         }
         if let Some(i) = pick_tr {
             self.set_translation(i);
@@ -4648,11 +4953,20 @@ fn draw_line(
         if it.start == it.end {
             let center = egui::pos2(left + it.width * 0.5, cy);
             painter.circle_stroke(center, it.width * 0.5 - 1.0, Stroke::new(1.5, accent));
+            // start == 1 is the marker closing the opening letters of a verse: it shows
+            // the number just before the verse's own.
+            let own: u16 = lay.ref_labels[v]
+                .rsplit(':')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let shown = if it.start == 1 { own.saturating_sub(1) } else { own };
             let (label, family, scale) = if m.numeric_verses {
-                let n = lay.ref_labels[v].rsplit(':').next().unwrap_or("");
-                (n, FontFamily::Proportional, if n.len() >= 3 { 0.38 } else { 0.46 })
+                let n = shown.to_string();
+                let sc = if n.len() >= 3 { 0.38 } else { 0.46 };
+                (n, FontFamily::Proportional, sc)
             } else {
-                (lay.markers[v].as_str(), m.font.family.clone(), 0.5)
+                (arabic::to_arabic_indic(shown), m.font.family.clone(), 0.5)
             };
             painter.text(
                 center,
@@ -4944,6 +5258,34 @@ fn arabic_block_hl(
     hl: &[bool],
     hl_color: Color32,
 ) {
+    arabic_block_inner(ui, shaped, font, color, hl, hl_color, None);
+}
+
+/// Like `arabic_block_hl`, but a word can be long-pressed: returns its index (reading
+/// order) at the moment the long press is recognised.
+fn arabic_block_words(
+    ui: &mut egui::Ui,
+    shaped: &str,
+    font: &FontId,
+    color: Color32,
+    hl: &[bool],
+    hl_color: Color32,
+    press: &mut PressTracker,
+) -> Option<usize> {
+    arabic_block_inner(ui, shaped, font, color, hl, hl_color, Some(press))
+}
+
+fn arabic_block_inner(
+    ui: &mut egui::Ui,
+    shaped: &str,
+    font: &FontId,
+    color: Color32,
+    hl: &[bool],
+    hl_color: Color32,
+    mut press: Option<&mut PressTracker>,
+) -> Option<usize> {
+    let mut picked: Option<usize> = None;
+    let mut any_down = false;
     ui.with_layout(
         Layout::right_to_left(Align::Min).with_main_wrap(true),
         |ui| {
@@ -4951,7 +5293,16 @@ fn arabic_block_hl(
             ui.spacing_mut().item_spacing.y = font.size * 0.25;
             for (j, word) in shaped.split(' ').enumerate() {
                 let size = marked_word_size(ui.painter(), word, font);
-                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let sense = if press.is_some() { Sense::click() } else { Sense::hover() };
+                let (rect, resp) = ui.allocate_exact_size(size, sense);
+                if let Some(tr) = press.as_mut() {
+                    if resp.is_pointer_button_down_on() {
+                        any_down = true;
+                        if tr.update(ui, j) {
+                            picked = Some(j);
+                        }
+                    }
+                }
                 if ui.is_rect_visible(rect) {
                     if hl.get(j).copied().unwrap_or(false) {
                         let pad = font.size * 0.08;
@@ -4974,6 +5325,13 @@ fn arabic_block_hl(
             }
         },
     );
+    // No finger on any word: the next press starts a fresh long-press timer.
+    if !any_down {
+        if let Some(tr) = press {
+            *tr = PressTracker::default();
+        }
+    }
+    picked
 }
 
 /// Byte ranges of every case-insensitive occurrence of `needle` in `text`.

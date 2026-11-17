@@ -11,6 +11,18 @@ pub struct SurahInfo {
     pub arabic: &'static str,
 }
 
+/// Surahs that open with disconnected letters (الر، طس، ص، ق، ن ...) which the data
+/// joins to the words after them in ONE verse. The reader shows the letters as a verse
+/// of their own, with their own number, and the verse numbers after them move up by one.
+/// (Only the number shown changes; `ayah`, the audio, translations and tafsir stay as
+/// they are.)
+const LETTERS_THEN_TEXT: &[u16] = &[10, 11, 12, 13, 14, 15, 27, 38, 50, 68];
+
+/// True if surah `s` (1-based) shows its opening letters as a verse of their own.
+pub fn letters_split(s: u16) -> bool {
+    LETTERS_THEN_TEXT.contains(&s)
+}
+
 #[derive(Clone, Copy)]
 pub struct Verse {
     pub surah: u16,
@@ -49,6 +61,8 @@ pub struct TranslationSource {
     pub tafsir_file: &'static str,
     /// Download size of the tafsir ("" = not shown).
     pub tafsir_size: &'static str,
+    /// Word-by-word meanings that go with this translation: file name in the release.
+    pub wbw_file: &'static str,
     raw: Option<&'static str>,
 }
 
@@ -61,6 +75,16 @@ impl TranslationSource {
     /// Download address of this translation's tafsir.
     pub fn tafsir_url(&self) -> String {
         format!("{}{}", TRANSLATIONS_URL, self.tafsir_file)
+    }
+
+    /// Download address of this translation's word-by-word meanings.
+    pub fn wbw_url(&self) -> String {
+        format!("{}{}", TRANSLATIONS_URL, self.wbw_file)
+    }
+
+    /// Key of this translation's word meanings in `translations_version.txt`.
+    pub fn wbw_key(&self) -> String {
+        format!("wbw_{}", self.id)
     }
 
     /// Key of this translation's tafsir in `translations_version.txt`.
@@ -89,6 +113,7 @@ pub const TRANSLATIONS: &[TranslationSource] = &[
         size: "874 KB",
         tafsir_file: "tafsir_main.txt",
         tafsir_size: "",
+        wbw_file: "wbw_main.txt",
         raw: None,
     },
     TranslationSource {
@@ -99,6 +124,7 @@ pub const TRANSLATIONS: &[TranslationSource] = &[
         size: "882 KB",
         tafsir_file: "tafsir_en.txt",
         tafsir_size: "",
+        wbw_file: "wbw_en.txt",
         raw: None,
     },
     TranslationSource {
@@ -109,6 +135,7 @@ pub const TRANSLATIONS: &[TranslationSource] = &[
         size: "1.4 MB",
         tafsir_file: "tafsir_nyn.txt",
         tafsir_size: "",
+        wbw_file: "wbw_nyn.txt",
         raw: None,
     },
     TranslationSource {
@@ -119,6 +146,7 @@ pub const TRANSLATIONS: &[TranslationSource] = &[
         size: "782 KB",
         tafsir_file: "tafsir_sw.txt",
         tafsir_size: "",
+        wbw_file: "wbw_sw.txt",
         raw: None,
     },
 ];
@@ -131,6 +159,9 @@ pub struct QuranDataset {
     /// `tafsirs[t][global_verse_index]`: the tafsir that goes with translation `t`
     /// (empty until that tafsir has been downloaded).
     pub tafsirs: Vec<Vec<&'static str>>,
+    /// `wbws[t][global_verse_index]`: the word-by-word meanings of the verse for
+    /// translation `t`, separated by `;` (empty until downloaded).
+    pub wbws: Vec<Vec<&'static str>>,
     pub surah_offsets: Vec<(u32, u32)>,
 }
 
@@ -254,10 +285,12 @@ impl QuranDataset {
                 });
             }
 
+            // The opening letters of these surahs count as a verse of their own.
+            let letters_extra = if letters_split(s) { 1 } else { 0 };
             verses.push(Verse {
                 surah: s,
                 ayah: a,
-                num: if has_bismillah { a + 1 } else { a },
+                num: if has_bismillah { a + 1 } else { a } + letters_extra,
                 arabic: arabic_text,
             });
         }
@@ -281,10 +314,16 @@ impl QuranDataset {
             .map(|_| vec![""; verses.len()])
             .collect();
 
+        let wbws: Vec<Vec<&'static str>> = TRANSLATIONS
+            .iter()
+            .map(|_| vec![""; verses.len()])
+            .collect();
+
         Self {
             verses,
             translations,
             tafsirs,
+            wbws,
             surah_offsets,
         }
     }
@@ -317,6 +356,39 @@ impl QuranDataset {
     pub fn clear_translation(&mut self, t: usize) {
         let n = self.verses.len();
         if let Some(list) = self.translations.get_mut(t) {
+            *list = vec![""; n];
+        }
+    }
+
+    /// Installs downloaded word-by-word meanings (`surah|ayah|meaning;meaning;...` lines).
+    /// Returns false (and changes nothing) when it does not look like such a file.
+    pub fn set_wbw_text(&mut self, t: usize, text: String) -> bool {
+        if t >= self.wbws.len() {
+            return false;
+        }
+        let raw: &'static str = Box::leak(text.into_boxed_str());
+        let list = build_translation(&self.verses, raw);
+        if list.iter().filter(|s| !s.is_empty()).count() < 100 {
+            return false;
+        }
+        self.wbws[t] = list;
+        true
+    }
+
+    /// Word meanings of verse `global` for translation `t`, separated by `;`
+    /// ("" if unavailable).
+    pub fn wbw(&self, t: usize, global: usize) -> &'static str {
+        self.wbws
+            .get(t)
+            .and_then(|list| list.get(global))
+            .copied()
+            .unwrap_or("")
+    }
+
+    /// Forgets downloaded word meanings (after the user deleted the file).
+    pub fn clear_wbw(&mut self, t: usize) {
+        let n = self.verses.len();
+        if let Some(list) = self.wbws.get_mut(t) {
             *list = vec![""; n];
         }
     }
